@@ -1,0 +1,159 @@
+#
+# Builds linux_amd64 + linux_arm64 against DuckDB v2.0.0, signs them with the RTI extension key
+# (the `release` environment secret RTI_EXT_SIGNING_KEY), verifies every signature against the
+# committed public key, and on a v2.* tag attaches the signed assets plus .sha256 files to a release.
+#
+# Consumers install these through a pinned extension repository:
+#   CREATE EXTENSION REPOSITORY rti WITH PREFIX '<dir>' USING PUBLIC KEY '<.github/rti-public-key.pem>';
+#
+name: Sign release
+on:
+  push:
+    tags: ['v2.*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Attach the signed assets to the GitHub release for this tag (run on a tag ref)
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXT: fts
+  DUCKDB_VERSION: v2.0.0
+  # sha256 of the DER SubjectPublicKeyInfo of .github/rti-public-key.pem. Rotating the key = change both.
+  RTI_EXT_KEY_FPR: sha256:b22b85be0dc8793d2994f4ed271e2fbce80b6288d78dbf9d14e2f52342e920f4
+
+jobs:
+  build:
+    name: Build extension binaries
+    permissions:
+      contents: read
+    # Pinned to the v2.0-cyanoptera branch head (a moving branch, not a tag); bump both together.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@32100e613d23558024786a932622c08cea0a6299 # v2.0-cyanoptera
+    with:
+      ci_tools_version: 32100e613d23558024786a932622c08cea0a6299
+      extension_name: fts
+      duckdb_version: v2.0.0
+      exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;wasm_eh;wasm_mvp;wasm_threads;windows_amd64;windows_amd64_mingw;windows_arm64'
+      reduced_ci_mode: disabled
+      artifact_postfix: '-rti'
+
+  sign:
+    name: Sign and verify
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Check the pinned public key
+        run: |
+          set -euo pipefail
+          fpr="sha256:$(openssl pkey -pubin -in .github/rti-public-key.pem -outform DER | sha256sum | cut -d' ' -f1)"
+          [ "$fpr" = "$RTI_EXT_KEY_FPR" ] || { echo "::error::public key fingerprint $fpr != $RTI_EXT_KEY_FPR"; exit 1; }
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ env.EXT }}-${{ env.DUCKDB_VERSION }}-extension-linux_*-rti
+          path: in
+
+      - name: Collect and smoke-check binaries
+        run: |
+          set -euo pipefail
+          mkdir out
+          for arch in linux_amd64 linux_arm64; do
+            f="in/$EXT-$DUCKDB_VERSION-extension-$arch-rti/$EXT.duckdb_extension"
+            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
+            # gcc 16 can link libstdc++ statically, giving two C++ EH runtimes in one process.
+            readelf -d "$f" | grep -q 'NEEDED.*\[libstdc++\.so\.6\]' \
+              || { echo "::error::$arch: libstdc++.so.6 is not DT_NEEDED"; exit 1; }
+            # The metadata block (256 bytes before the signature) carries platform and DuckDB version.
+            meta=$(tail -c 512 "$f" | head -c 256 | tr -c '[:print:]' ' ')
+            grep -qw "$arch" <<<"$meta" && grep -qw "$DUCKDB_VERSION" <<<"$meta" \
+              || { echo "::error::$arch: unexpected metadata: $meta"; exit 1; }
+            cp "$f" "in/$arch.unsigned"
+          done
+
+      # The secret is in env for this step only; later steps read the mode-600 file.
+      - name: Write signing key
+        env:
+          RTI_EXT_SIGNING_KEY: ${{ secrets.RTI_EXT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printenv RTI_EXT_SIGNING_KEY > "$RUNNER_TEMP/k.pem"
+          chmod 600 "$RUNNER_TEMP/k.pem"
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/k.pem"
+          for arch in linux_amd64 linux_arm64; do
+            d=$(mktemp -d)
+            head -c -256 "in/$arch.unsigned" > "$d/body"
+            # Signed payload: sha256 over the concatenated sha256 of each 1 MiB chunk of the body
+            # (duckdb scripts/compute-extension-hash.sh), RSA PKCS#1 v1.5 / SHA-256.
+            (cd "$d" && split -b 1M body c_ && for c in c_*; do openssl dgst -binary -sha256 "$c"; done > concat)
+            openssl dgst -binary -sha256 "$d/concat" > "$d/hash"
+            openssl pkeyutl -sign -inkey "$key" -pkeyopt digest:sha256 -in "$d/hash" -out "$d/sig"
+            [ "$(stat -c%s "$d/sig")" = 256 ]
+            cat "$d/body" "$d/sig" > "out/$EXT.$arch.signed.duckdb_extension"
+          done
+
+      - name: Shred signing key
+        if: always()
+        run: shred -u "$RUNNER_TEMP/k.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/k.pem"
+
+      - name: Verify against the committed public key
+        run: |
+          set -euo pipefail
+          # Do NOT use upstream verify-extension-signing.sh: it exits 0 on a wrong key.
+          for f in out/*.duckdb_extension; do
+            d=$(mktemp -d)
+            head -c -256 "$f" > "$d/body"; tail -c 256 "$f" > "$d/sig"
+            (cd "$d" && split -b 1M body c_ && for c in c_*; do openssl dgst -binary -sha256 "$c"; done > concat)
+            openssl dgst -binary -sha256 "$d/concat" > "$d/hash"
+            openssl pkeyutl -verify -pubin -inkey .github/rti-public-key.pem -pkeyopt digest:sha256 -in "$d/hash" -sigfile "$d/sig"
+            (cd out && sha256sum "$(basename "$f")" > "$(basename "$f").sha256")
+          done
+          cat out/*.sha256
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.EXT }}-${{ env.DUCKDB_VERSION }}-signed
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    name: Attach to GitHub release
+    needs: sign
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.EXT }}-${{ env.DUCKDB_VERSION }}-signed
+          path: out
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "::error::publish needs a tag ref, got $GITHUB_REF"; exit 1; }
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "Signed with $RTI_EXT_KEY_FPR (DuckDB $DUCKDB_VERSION)."
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber out/*
