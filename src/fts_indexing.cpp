@@ -52,7 +52,10 @@ static bool SupportsFTSTriggers(ClientContext &context,
   auto &catalog = Catalog::GetCatalog(context, qname.Catalog());
   auto &attached = catalog.GetAttached();
   if (!attached.HasStorageManager()) {
-    return true;
+    // Only DuckDB's own catalog supports triggers. Other catalogs without a
+    // storage manager (e.g. DuckLake) reject CREATE/DROP TRIGGER, so they get
+    // rebuild-only indexes and no trigger DROP on (re)create.
+    return catalog.IsDuckCatalog();
   }
   auto &storage_manager = attached.GetStorageManager();
   return storage_manager.InMemory() ||
