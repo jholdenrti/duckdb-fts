@@ -1,5 +1,5 @@
 # name: test/sql/fts/test_fts_ducklake.test
-# description: FTS indexes on DuckLake tables (no trigger support), at DuckLake spec 1.0 and 1.1
+# description: FTS indexes on DuckLake tables (no trigger support), at DuckLake spec 1.0 and 1.1, and across the 1.0 -> 1.1 migration
 # group: [fts]
 
 require fts
@@ -12,52 +12,16 @@ require skip_reload
 
 require no_alternative_verify
 
-# DuckLake 1.0 has no NULL type, so it cannot store match_bm25's NULL parameter
-# defaults (fields := NULL, ...): the index build fails cleanly, past the trigger step.
-statement ok
-SET ducklake_default_version='1.0'
-
-statement ok
-ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_1.0.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_1.0_files')
-
-statement ok
-CREATE TABLE dl.docs (id INTEGER NOT NULL, title VARCHAR, body VARCHAR)
-
-statement ok
-INSERT INTO dl.docs VALUES (1, 'ducks', 'the duck swims on the lake')
-
-statement ok
-USE dl
-
-statement error
-PRAGMA create_fts_index('docs', 'id', 'title', 'body')
-----
-DuckLake 1.0 does not support the NULL type
-
-query I
-SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dl' AND schema_name = 'fts_main_docs'
-----
-0
-
-statement ok
-USE memory
-
-statement ok
-DETACH dl
-
-# 1.0 = the 1.0 catalog above, migrated to 1.1 on attach; 1.1 = a fresh 1.1 catalog
+# a catalog on spec 1.0 (stores match_bm25's NULL defaults as 1.1 does) and on spec 1.1
 foreach VER 1.0 1.1
 
 statement ok
-SET ducklake_default_version='1.1'
-
-statement ok
-ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_{VER}.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_{VER}_files', AUTOMATIC_MIGRATION TRUE)
+ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_{VER}.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_{VER}_files', DUCKLAKE_VERSION '{VER}')
 
 query I
-SELECT value FROM __ducklake_metadata_dl.ducklake_metadata WHERE key = 'version'
+SELECT value = '{VER}' FROM __ducklake_metadata_dl.ducklake_metadata WHERE key = 'version'
 ----
-1.1
+true
 
 statement ok
 USE dl
@@ -108,29 +72,29 @@ statement ok
 DETACH dl
 
 statement ok
-ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_{VER}.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_{VER}_files')
+ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_{VER}.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_{VER}_files', DUCKLAKE_VERSION '{VER}')
 
 statement ok
 USE dl
 
-# macro parameter defaults after re-attach
-query III
-SELECT p.parameter_name, p.default_value, p.default_value_type
+# macro parameter defaults after re-attach: the text 'NULL' (never SQL NULL), read back as NULL
+query IIII
+SELECT p.parameter_name, p.default_value IS NULL, p.default_value, p.default_value_type
 FROM __ducklake_metadata_dl.ducklake_macro_parameters p
 JOIN __ducklake_metadata_dl.ducklake_macro m USING (macro_id)
 WHERE m.macro_name = 'match_bm25' AND m.end_snapshot IS NULL
 ORDER BY p.column_id
 ----
-docname	NULL	unknown
-query_string	NULL	unknown
-fields	NULL	null
-k	1.2	decimal(2,1)
-b	0.75	decimal(3,2)
-conjunctive	false	boolean
-field_weights	NULL	null
-field_b	NULL	null
-scoring_model	bm25f	varchar
-tie_breaker	0.0	decimal(2,1)
+docname	false	NULL	unknown
+query_string	false	NULL	unknown
+fields	false	NULL	null
+k	false	1.2	decimal(2,1)
+b	false	0.75	decimal(3,2)
+conjunctive	false	false	boolean
+field_weights	false	NULL	null
+field_b	false	NULL	null
+scoring_model	false	bm25f	varchar
+tie_breaker	false	0.0	decimal(2,1)
 
 # fields := NULL (default) searches every indexed field, ranked
 query II
@@ -253,7 +217,7 @@ statement ok
 DETACH dl
 
 statement ok
-ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_{VER}.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_{VER}_files')
+ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_{VER}.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_{VER}_files', DUCKLAKE_VERSION '{VER}')
 
 statement ok
 USE dl
@@ -281,6 +245,48 @@ statement ok
 DETACH dl
 
 endloop
+
+# the 1.0 catalog migrated to 1.1: indexes built on 1.0 keep working and rebuild
+statement ok
+ATTACH 'ducklake:duckdb:{TEST_DIR}/fts_dl_1.0.db' AS dl (DATA_PATH '{TEST_DIR}/fts_dl_1.0_files', DUCKLAKE_VERSION '1.1', AUTOMATIC_MIGRATION TRUE)
+
+query I
+SELECT value FROM __ducklake_metadata_dl.ducklake_metadata WHERE key = 'version'
+----
+1.1
+
+query I
+SELECT count(*) FROM __ducklake_metadata_dl.ducklake_macro_parameters WHERE default_value IS NULL
+----
+0
+
+statement ok
+USE dl
+
+query I
+SELECT chunk_id FROM (
+    SELECT chunk_id, fts_rag_sabc123.match_bm25(chunk_id, 'revenue') AS score FROM dl.rag.sabc123
+) WHERE score IS NOT NULL ORDER BY score DESC
+----
+3
+1
+
+statement ok
+PRAGMA create_fts_index('rag.schema_index', 'chunk_key', 'content', overwrite = 1)
+
+query I
+SELECT chunk_key FROM (
+    SELECT chunk_key, fts_rag_schema_index.match_bm25(chunk_key, 'region') AS score FROM dl.rag.schema_index
+) WHERE score IS NOT NULL ORDER BY score DESC, chunk_key
+----
+sales.region
+sales
+
+statement ok
+USE memory
+
+statement ok
+DETACH dl
 
 # native DuckDB tables keep trigger-maintained incremental indexes
 statement ok
